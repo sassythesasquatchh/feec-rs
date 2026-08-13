@@ -1,0 +1,34 @@
+[package]
+name = "formoniq"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Attributed FEEC thesis fork of Luis Wirth's formoniq"
+
+[features]
+default = []
+external-solver-tests = []
+parent-fixture-tests = ["external-solver-tests"]
+
+[dependencies]
+ddf = { path = "../ddf" }
+exterior = { path = "../exterior" }
+manifold = { path = "../manifold" }
+common = { path = "../common" }
+
+nalgebra = "0.33.2"
+nalgebra-sparse = "0.10.0"
+
+tracing = "0.1.41"
+itertools = "0.14.0"
+rayon = "1.10.0"
+approx = "0.5.1"
+
+
+[dev-dependencies]
+tracing-subscriber = "0.3.19"
+#reqwest = { version = "0.12.9", features = ["blocking"] }

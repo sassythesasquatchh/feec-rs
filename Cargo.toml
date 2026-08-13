@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+
+members = [
+  "crates/formoniq",
+  "crates/ddf",
+  "crates/exterior",
+  "crates/manifold",
+  "crates/common",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+authors = ["Patrick Dowd", "Luis Wirth"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sassythesasquatchh/feec"
+publish = false

@@ -1,0 +1,18 @@
+[package]
+name = "exterior"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Exterior algebra for the formoniq thesis fork"
+
+[dependencies]
+common = { path = "../common" }
+
+nalgebra = "0.33.2"
+
+itertools = "0.14.0"
+approx = "0.5.1"

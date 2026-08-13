@@ -1,0 +1,14 @@
+/target
+/out/
+/petsc-solver/tmp/
+/.direnv
+
+flamegraph.svg
+perf.data
+perf.data.old
+
+/petsc
+/slepc
+
+.vscode
+meshes/*
