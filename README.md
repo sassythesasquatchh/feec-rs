@@ -10,10 +10,10 @@ The recorded upstream baseline is Luis Wirth's commit
 “bsc-thesis version”. This fork has since added boundary-aware assembly,
 nonlinear electromagnetic residuals and Jacobians, spatiotemporal slice
 assembly, reconstruction operators, and backend-neutral integration contracts.
-It should not be treated as interchangeable with the upstream package.
+These additions distinguish the thesis fork from the upstream package.
 
-The workspace is independently buildable and has no dependency on the parent
-FEEC–GMRF integration workspace:
+The parent FEEC–GMRF integration workspace depends on this standalone
+workspace. Verify it directly with:
 
 ```text
 cargo test --release --workspace

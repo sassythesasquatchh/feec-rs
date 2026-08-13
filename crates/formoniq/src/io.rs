@@ -276,7 +276,7 @@ pub fn write_cochain_vtu(
 ///
 /// - The provided cochain must have degree 1.
 /// - The vectors are piecewise constant: one vector per top-dimensional cell, evaluated at its barycenter.
-/// - Whitney evaluation is ambient-valued, so embedded meshes are handled without a special path.
+/// - Ambient-valued Whitney evaluation handles embedded meshes directly.
 pub fn sample_1form_cell_vectors(
   coords: &MeshCoords,
   topology: &Complex,

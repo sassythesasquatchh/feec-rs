@@ -21,9 +21,8 @@ use {
 ///
 /// `||u - u_h||_{H(d)} = (||u - u_h||² + ||d(u - u_h)||²)^(1/2)`.
 ///
-/// Keeping this operation here ensures convergence studies report the same
-/// mathematical norm instead of accidentally substituting its derivative
-/// seminorm.
+/// This shared operation keeps the graph-norm definition consistent across
+/// convergence studies.
 pub fn hd_error(l2_error: f64, derivative_l2_error: f64) -> f64 {
   l2_error.hypot(derivative_l2_error)
 }
