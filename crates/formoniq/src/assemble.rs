@@ -1185,7 +1185,7 @@ fn boundary_elvec_for_facet<F: DifferentialMultiForm>(
 /// The factor combines
 /// - the sign of the facet in the boundary chain of its parent cell, and
 /// - the orientation of that cell with respect to the ambient coordinates.
-fn boundary_orientation_sign(facet: SimplexHandle, coords: &MeshCoords) -> f64 {
+pub fn boundary_orientation_sign(facet: SimplexHandle, coords: &MeshCoords) -> f64 {
   let parent_cell = facet
     .cocells()
     .next()
