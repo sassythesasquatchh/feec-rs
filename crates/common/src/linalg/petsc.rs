@@ -616,6 +616,7 @@ fn ghiep_args(which: GhiepWhich, neigen_values: usize) -> Vec<String> {
 fn ghep_reduced_args(
   which: GhiepWhich,
   neigen_values: usize,
+  u_dimension: usize,
   mass_solve: GhiepReducedSolve,
 ) -> Vec<String> {
   let mut args = vec![
@@ -636,7 +637,7 @@ fn ghep_reduced_args(
     }
   }
 
-  let ncv = (neigen_values.saturating_mul(4)).max(neigen_values);
+  let ncv = ghep_reduced_search_space_dimension(neigen_values, u_dimension);
   args.push("-eps_ncv".into());
   args.push(ncv.to_string());
 
@@ -688,6 +689,24 @@ fn ghep_reduced_args(
   }
 
   args
+}
+
+/// Choose a bounded Krylov--Schur search-space dimension for a partial solve.
+///
+/// A search space wider than the requested eigenspace gives restarted
+/// Krylov--Schur room to converge clusters.  Multiplying the requested rank by
+/// a fixed factor is inappropriate at large rank, however: SLEPc caps `ncv` at
+/// the operator dimension, which silently turns a partial solve into a
+/// full-space solve.  We instead oversample by 25%, bounded to 32--256 vectors,
+/// and cap at the operator dimension.  Thus `ncv > nev` whenever the dimension
+/// permits it, while an explicitly requested full-rank solve uses `ncv = nev`.
+fn ghep_reduced_search_space_dimension(requested_rank: usize, u_dimension: usize) -> usize {
+  if requested_rank >= u_dimension {
+    return u_dimension;
+  }
+
+  let oversampling = (requested_rank / 4).clamp(32, 256);
+  requested_rank.saturating_add(oversampling).min(u_dimension)
 }
 
 pub fn petsc_ghiep_with_which(
@@ -957,7 +976,7 @@ pub fn try_petsc_ghep_reduced_with_which(
     write_generalized_eigenproblem_input(operator, &in_path.join(name), &binary, &workspace)?;
   }
 
-  let args = ghep_reduced_args(which, neigen_values, mass_solve);
+  let args = ghep_reduced_args(which, neigen_values, operators.mk.nrows(), mass_solve);
 
   let status = try_run_petsc_command(&binary, &workspace, &args)?;
   if !status.success() {
@@ -1397,7 +1416,7 @@ mod tests {
 
   #[test]
   fn ghep_reduced_args_direct_uses_lu() {
-    let args = ghep_reduced_args(GhiepWhich::Largest, 4, GhiepReducedSolve::Direct);
+    let args = ghep_reduced_args(GhiepWhich::Largest, 4, 100, GhiepReducedSolve::Direct);
     assert!(args.iter().any(|arg| arg == "-mkm1_ksp_type"));
     assert!(args.iter().any(|arg| arg == "preonly"));
     assert!(args.iter().any(|arg| arg == "-mkm1_pc_type"));
@@ -1406,11 +1425,38 @@ mod tests {
 
   #[test]
   fn ghep_reduced_args_iterative_uses_cg() {
-    let args = ghep_reduced_args(GhiepWhich::Largest, 4, GhiepReducedSolve::Iterative);
+    let args = ghep_reduced_args(GhiepWhich::Largest, 4, 100, GhiepReducedSolve::Iterative);
     assert!(args.iter().any(|arg| arg == "-mkm1_ksp_type"));
     assert!(args.iter().any(|arg| arg == "cg"));
     assert!(args.iter().any(|arg| arg == "-mkm1_pc_type"));
     assert!(args.iter().any(|arg| arg == "jacobi"));
+  }
+
+  #[test]
+  fn ghep_reduced_search_space_is_bounded_for_large_partial_solve() {
+    assert_eq!(ghep_reduced_search_space_dimension(2_048, 3_032), 2_304);
+
+    let args = ghep_reduced_args(
+      GhiepWhich::Smallest,
+      2_048,
+      3_032,
+      GhiepReducedSolve::Direct,
+    );
+    let ncv_index = args
+      .iter()
+      .position(|arg| arg == "-eps_ncv")
+      .expect("reduced eigenproblem must specify a search-space dimension");
+    assert_eq!(args.get(ncv_index + 1).map(String::as_str), Some("2304"));
+  }
+
+  #[test]
+  fn ghep_reduced_search_space_handles_small_and_full_rank_solves() {
+    // Small partial solves get the minimum oversampling when space permits.
+    assert_eq!(ghep_reduced_search_space_dimension(4, 100), 36);
+    // Close-to-full partial solves are capped by the operator dimension.
+    assert_eq!(ghep_reduced_search_space_dimension(4, 5), 5);
+    // A deliberate full-rank gate cannot have ncv > nev.
+    assert_eq!(ghep_reduced_search_space_dimension(7, 7), 7);
   }
 
   #[test]

@@ -140,6 +140,12 @@ int main(int argc, char **argv)
   CHKERRQ(ierr);
   ierr = EPSSetProblemType(eps, EPS_GHEP);
   CHKERRQ(ierr);
+  /*
+   * This is only the helper's no-option default.  Keep EPSSetFromOptions after
+   * all programmatic defaults so the Rust caller's -eps_{smallest,largest}_real,
+   * -eps_nev, and -eps_ncv arguments determine the runtime target and search
+   * dimensions.
+   */
   ierr = EPSSetWhichEigenpairs(eps, EPS_LARGEST_REAL);
   CHKERRQ(ierr);
   ierr = EPSSetFromOptions(eps);
