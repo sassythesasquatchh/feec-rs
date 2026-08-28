@@ -201,6 +201,18 @@ pub enum PetscError {
     requested: usize,
     dimension: usize,
   },
+  InvalidReducedGeneralizedEigenproblemDimensions {
+    l_rows: usize,
+    l_cols: usize,
+    d_rows: usize,
+    d_cols: usize,
+    c_rows: usize,
+    c_cols: usize,
+    mkm1_rows: usize,
+    mkm1_cols: usize,
+    mk_rows: usize,
+    mk_cols: usize,
+  },
   NonFiniteInputEntry {
     operator: &'static str,
     row: usize,
@@ -238,6 +250,26 @@ pub enum PetscError {
     workspace: PathBuf,
     detail: String,
   },
+  InvalidReducedHelperOutputShape {
+    binary: PathBuf,
+    workspace: PathBuf,
+    eigenvalue_count: usize,
+    sigma_rows: usize,
+    sigma_cols: usize,
+    u_rows: usize,
+    u_cols: usize,
+    expected_sigma_rows: usize,
+    expected_u_rows: usize,
+  },
+  InsufficientReducedEigenpairConvergence {
+    binary: PathBuf,
+    workspace: PathBuf,
+    requested: usize,
+    converged: usize,
+  },
+  ReducedEigenproblemResourceOverflow {
+    quantity: &'static str,
+  },
 }
 
 impl fmt::Display for PetscError {
@@ -258,6 +290,21 @@ impl fmt::Display for PetscError {
       } => write!(
         formatter,
         "PETSc generalized eigenproblem rank must be in 1..={dimension}, got {requested}"
+      ),
+      Self::InvalidReducedGeneralizedEigenproblemDimensions {
+        l_rows,
+        l_cols,
+        d_rows,
+        d_cols,
+        c_rows,
+        c_cols,
+        mkm1_rows,
+        mkm1_cols,
+        mk_rows,
+        mk_cols,
+      } => write!(
+        formatter,
+        "PETSc reduced generalized Hodge eigenproblem has incompatible blocks: L={l_rows}x{l_cols}, D={d_rows}x{d_cols}, C={c_rows}x{c_cols}, Mkm1={mkm1_rows}x{mkm1_cols}, Mk={mk_rows}x{mk_cols}"
       ),
       Self::NonFiniteInputEntry {
         operator,
@@ -313,6 +360,33 @@ impl fmt::Display for PetscError {
         formatter,
         "invalid PETSc helper output from binary {binary:?} in workspace {workspace:?}: {detail}"
       ),
+      Self::InvalidReducedHelperOutputShape {
+        binary,
+        workspace,
+        eigenvalue_count,
+        sigma_rows,
+        sigma_cols,
+        u_rows,
+        u_cols,
+        expected_sigma_rows,
+        expected_u_rows,
+      } => write!(
+        formatter,
+        "invalid reduced PETSc helper output from binary {binary:?} in workspace {workspace:?}: {eigenvalue_count} eigenvalues, sigma {sigma_rows}x{sigma_cols} (expected {expected_sigma_rows} rows), u {u_rows}x{u_cols} (expected {expected_u_rows} rows)"
+      ),
+      Self::InsufficientReducedEigenpairConvergence {
+        binary,
+        workspace,
+        requested,
+        converged,
+      } => write!(
+        formatter,
+        "PETSc reduced Hodge helper {binary:?} converged {converged} eigenpairs, fewer than requested {requested}, in workspace {workspace:?}"
+      ),
+      Self::ReducedEigenproblemResourceOverflow { quantity } => write!(
+        formatter,
+        "PETSc reduced Hodge eigenproblem resource diagnostic overflow for {quantity}"
+      ),
     }
   }
 }
@@ -347,6 +421,34 @@ pub struct PetscGeneralizedEigenpairs {
   pub eigenvalues: Vector,
   pub eigenvectors: Matrix,
   pub diagnostics: PetscGeneralizedEigenDiagnostics,
+}
+
+/// Diagnostics for one sparse mixed/reduced generalized Hodge helper run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PetscReducedGeneralizedEigenDiagnostics {
+  pub sigma_dimension: usize,
+  pub u_dimension: usize,
+  pub requested_rank: usize,
+  pub converged_rank: usize,
+  pub l_nonzeros: usize,
+  pub d_nonzeros: usize,
+  pub c_nonzeros: usize,
+  pub mkm1_nonzeros: usize,
+  pub mk_nonzeros: usize,
+  pub input_nonzeros: usize,
+  pub which: GhiepWhich,
+  pub mass_solve: GhiepReducedSolve,
+  pub workspace: PathBuf,
+  pub binary: PathBuf,
+}
+
+/// Mixed/reduced generalized Hodge eigenpairs with retained helper context.
+#[derive(Debug)]
+pub struct PetscReducedGeneralizedEigenpairs {
+  pub eigenvalues: Vector,
+  pub sigma_eigenvectors: Matrix,
+  pub u_eigenvectors: Matrix,
+  pub diagnostics: PetscReducedGeneralizedEigenDiagnostics,
 }
 
 pub fn petsc_write_matrix(matrix: &CsrMatrix, filename: &str) -> std::io::Result<()> {
@@ -801,6 +903,7 @@ fn validate_generalized_eigenproblem_output(
 ///
 /// Keeping these matrices together makes the discrete equation explicit and
 /// prevents callers from accidentally swapping same-shaped operator blocks.
+#[derive(Debug, Clone, Copy)]
 pub struct GhepReducedOperators<'a> {
   pub l: &'a CsrMatrix,
   pub d: &'a CsrMatrix,
@@ -815,37 +918,229 @@ pub fn petsc_ghep_reduced_with_which(
   which: GhiepWhich,
   mass_solve: GhiepReducedSolve,
 ) -> (Vector, Matrix, Matrix) {
+  let result = try_petsc_ghep_reduced_with_which(operators, neigen_values, which, mass_solve)
+    .unwrap_or_else(|error| panic!("{error}"));
+  let k = neigen_values;
+  (
+    result.eigenvalues.rows(0, k).into_owned(),
+    result.sigma_eigenvectors.columns(0, k).into_owned(),
+    result.u_eigenvectors.columns(0, k).into_owned(),
+  )
+}
+
+/// Solve the sparse mixed/reduced generalized Hodge eigenproblem without panicking.
+///
+/// The helper applies
+/// `K = L + D M_(k-1)^(-1) C` as a shell operator and solves
+/// `K u = lambda M_k u`.  Every block is written sparsely; this Rust boundary
+/// never materializes the marginal `K`, never falls back to a dense solver,
+/// and retains the unique helper workspace in its diagnostics.
+pub fn try_petsc_ghep_reduced_with_which(
+  operators: GhepReducedOperators<'_>,
+  neigen_values: usize,
+  which: GhiepWhich,
+  mass_solve: GhiepReducedSolve,
+) -> Result<PetscReducedGeneralizedEigenpairs, PetscError> {
+  validate_reduced_generalized_eigenproblem(operators, neigen_values)?;
   let solver_path = petsc_solver_path();
-  let workspace = create_petsc_workspace(&solver_path);
+  let binary = solver_path.join("ghep_reduced.out");
+  let workspace = try_create_petsc_workspace(&solver_path)?;
 
   let in_path = workspace.join("in");
-  petsc_write_matrix(operators.l, in_path.join("L.bin").to_str().unwrap()).unwrap();
-  petsc_write_matrix(operators.d, in_path.join("D.bin").to_str().unwrap()).unwrap();
-  petsc_write_matrix(operators.c, in_path.join("C.bin").to_str().unwrap()).unwrap();
-  petsc_write_matrix(operators.mkm1, in_path.join("Mkm1.bin").to_str().unwrap()).unwrap();
-  petsc_write_matrix(operators.mk, in_path.join("Mk.bin").to_str().unwrap()).unwrap();
+  for (name, operator) in [
+    ("L.bin", operators.l),
+    ("D.bin", operators.d),
+    ("C.bin", operators.c),
+    ("Mkm1.bin", operators.mkm1),
+    ("Mk.bin", operators.mk),
+  ] {
+    write_generalized_eigenproblem_input(operator, &in_path.join(name), &binary, &workspace)?;
+  }
 
-  let binary = solver_path.join("ghep_reduced.out");
   let args = ghep_reduced_args(which, neigen_values, mass_solve);
 
-  let status = run_petsc_command(&binary, &workspace, &args);
-  assert!(status.success());
+  let status = try_run_petsc_command(&binary, &workspace, &args)?;
+  if !status.success() {
+    return Err(PetscError::HelperExit {
+      binary,
+      workspace,
+      status,
+    });
+  }
 
-  let eigenvals =
-    petsc_read_eigenvals(workspace.join("out/eigenvals.bin").to_str().unwrap()).unwrap();
+  let eigenvalues =
+    read_eigenvalues_with_context(&workspace.join("out/eigenvals.bin"), &binary, &workspace)?;
+  let sigma_eigenvectors = read_eigenvectors_with_context(
+    &workspace.join("out/eigenvecs_sigma.bin"),
+    &binary,
+    &workspace,
+  )?;
+  let u_eigenvectors =
+    read_eigenvectors_with_context(&workspace.join("out/eigenvecs_u.bin"), &binary, &workspace)?;
+  validate_reduced_generalized_eigenproblem_output(
+    &eigenvalues,
+    &sigma_eigenvectors,
+    &u_eigenvectors,
+    operators.mkm1.nrows(),
+    operators.mk.nrows(),
+    neigen_values,
+    &binary,
+    &workspace,
+  )?;
 
-  let sigma_eigenvecs =
-    petsc_read_eigenvecs(workspace.join("out/eigenvecs_sigma.bin").to_str().unwrap()).unwrap();
-  let u_eigenvecs =
-    petsc_read_eigenvecs(workspace.join("out/eigenvecs_u.bin").to_str().unwrap()).unwrap();
+  let converged_rank = eigenvalues.len();
+  let input_nonzeros = [
+    operators.l.nnz(),
+    operators.d.nnz(),
+    operators.c.nnz(),
+    operators.mkm1.nnz(),
+    operators.mk.nnz(),
+  ]
+  .into_iter()
+  .try_fold(0usize, usize::checked_add)
+  .ok_or(PetscError::ReducedEigenproblemResourceOverflow {
+    quantity: "input nonzero count",
+  })?;
+  Ok(PetscReducedGeneralizedEigenpairs {
+    eigenvalues,
+    sigma_eigenvectors,
+    u_eigenvectors,
+    diagnostics: PetscReducedGeneralizedEigenDiagnostics {
+      sigma_dimension: operators.mkm1.nrows(),
+      u_dimension: operators.mk.nrows(),
+      requested_rank: neigen_values,
+      converged_rank,
+      l_nonzeros: operators.l.nnz(),
+      d_nonzeros: operators.d.nnz(),
+      c_nonzeros: operators.c.nnz(),
+      mkm1_nonzeros: operators.mkm1.nnz(),
+      mk_nonzeros: operators.mk.nnz(),
+      input_nonzeros,
+      which,
+      mass_solve,
+      workspace,
+      binary,
+    },
+  })
+}
 
-  let k = neigen_values.min(eigenvals.len());
-  let eigenvals = eigenvals.rows(0, k).into_owned();
+fn validate_reduced_generalized_eigenproblem(
+  operators: GhepReducedOperators<'_>,
+  requested_rank: usize,
+) -> Result<(), PetscError> {
+  let sigma_dimension = operators.mkm1.nrows();
+  let u_dimension = operators.mk.nrows();
+  let valid = sigma_dimension > 0
+    && u_dimension > 0
+    && operators.mkm1.ncols() == sigma_dimension
+    && operators.mk.ncols() == u_dimension
+    && operators.l.nrows() == u_dimension
+    && operators.l.ncols() == u_dimension
+    && operators.d.nrows() == u_dimension
+    && operators.d.ncols() == sigma_dimension
+    && operators.c.nrows() == sigma_dimension
+    && operators.c.ncols() == u_dimension;
+  if !valid {
+    return Err(
+      PetscError::InvalidReducedGeneralizedEigenproblemDimensions {
+        l_rows: operators.l.nrows(),
+        l_cols: operators.l.ncols(),
+        d_rows: operators.d.nrows(),
+        d_cols: operators.d.ncols(),
+        c_rows: operators.c.nrows(),
+        c_cols: operators.c.ncols(),
+        mkm1_rows: operators.mkm1.nrows(),
+        mkm1_cols: operators.mkm1.ncols(),
+        mk_rows: operators.mk.nrows(),
+        mk_cols: operators.mk.ncols(),
+      },
+    );
+  }
+  if requested_rank == 0 || requested_rank > u_dimension {
+    return Err(PetscError::InvalidRequestedEigenpairs {
+      requested: requested_rank,
+      dimension: u_dimension,
+    });
+  }
+  for (name, operator) in [
+    ("L", operators.l),
+    ("D", operators.d),
+    ("C", operators.c),
+    ("Mkm1", operators.mkm1),
+    ("Mk", operators.mk),
+  ] {
+    validate_finite_operator(operator, name)?;
+  }
+  Ok(())
+}
 
-  let u_eigenvecs = u_eigenvecs.columns(0, k).into_owned();
-  let sigma_eigenvecs = sigma_eigenvecs.columns(0, k).into_owned();
-
-  (eigenvals, sigma_eigenvecs, u_eigenvecs)
+#[allow(clippy::too_many_arguments)]
+fn validate_reduced_generalized_eigenproblem_output(
+  eigenvalues: &Vector,
+  sigma_eigenvectors: &Matrix,
+  u_eigenvectors: &Matrix,
+  sigma_dimension: usize,
+  u_dimension: usize,
+  requested_rank: usize,
+  binary: &Path,
+  workspace: &Path,
+) -> Result<(), PetscError> {
+  let converged = eigenvalues.len();
+  if sigma_eigenvectors.nrows() != sigma_dimension
+    || u_eigenvectors.nrows() != u_dimension
+    || sigma_eigenvectors.ncols() != converged
+    || u_eigenvectors.ncols() != converged
+  {
+    return Err(PetscError::InvalidReducedHelperOutputShape {
+      binary: binary.to_path_buf(),
+      workspace: workspace.to_path_buf(),
+      eigenvalue_count: converged,
+      sigma_rows: sigma_eigenvectors.nrows(),
+      sigma_cols: sigma_eigenvectors.ncols(),
+      u_rows: u_eigenvectors.nrows(),
+      u_cols: u_eigenvectors.ncols(),
+      expected_sigma_rows: sigma_dimension,
+      expected_u_rows: u_dimension,
+    });
+  }
+  if converged < requested_rank {
+    return Err(PetscError::InsufficientReducedEigenpairConvergence {
+      binary: binary.to_path_buf(),
+      workspace: workspace.to_path_buf(),
+      requested: requested_rank,
+      converged,
+    });
+  }
+  if let Some((index, value)) = eigenvalues
+    .iter()
+    .copied()
+    .enumerate()
+    .find(|(_, value)| !value.is_finite())
+  {
+    return Err(PetscError::InvalidHelperOutput {
+      binary: binary.to_path_buf(),
+      workspace: workspace.to_path_buf(),
+      detail: format!("eigenvalue {index} is non-finite: {value}"),
+    });
+  }
+  for (name, matrix) in [
+    ("sigma eigenvector", sigma_eigenvectors),
+    ("u eigenvector", u_eigenvectors),
+  ] {
+    if let Some((index, value)) = matrix
+      .iter()
+      .copied()
+      .enumerate()
+      .find(|(_, value)| !value.is_finite())
+    {
+      return Err(PetscError::InvalidHelperOutput {
+        binary: binary.to_path_buf(),
+        workspace: workspace.to_path_buf(),
+        detail: format!("{name} entry {index} is non-finite: {value}"),
+      });
+    }
+  }
+  Ok(())
 }
 
 pub fn petsc_ghep_reduced_direct(
@@ -1116,6 +1411,137 @@ mod tests {
     assert!(args.iter().any(|arg| arg == "cg"));
     assert!(args.iter().any(|arg| arg == "-mkm1_pc_type"));
     assert!(args.iter().any(|arg| arg == "jacobi"));
+  }
+
+  #[test]
+  fn typed_ghep_reduced_rejects_incompatible_blocks_and_rank_before_launch() {
+    let l = diagonal(&[1.0, 2.0, 4.0]);
+    let mk = diagonal(&[1.0, 1.0, 1.0]);
+    let mkm1 = diagonal(&[1.0, 1.0]);
+    let d = CsrMatrix::from(&CooMatrix::new(3, 2));
+    let invalid_c = CsrMatrix::from(&CooMatrix::new(3, 2));
+    let error = try_petsc_ghep_reduced_with_which(
+      GhepReducedOperators {
+        l: &l,
+        d: &d,
+        c: &invalid_c,
+        mkm1: &mkm1,
+        mk: &mk,
+      },
+      1,
+      GhiepWhich::Smallest,
+      GhiepReducedSolve::Direct,
+    )
+    .unwrap_err();
+    assert!(matches!(
+      error,
+      PetscError::InvalidReducedGeneralizedEigenproblemDimensions { .. }
+    ));
+
+    let c = CsrMatrix::from(&CooMatrix::new(2, 3));
+    for requested in [0, 4] {
+      let error = try_petsc_ghep_reduced_with_which(
+        GhepReducedOperators {
+          l: &l,
+          d: &d,
+          c: &c,
+          mkm1: &mkm1,
+          mk: &mk,
+        },
+        requested,
+        GhiepWhich::Smallest,
+        GhiepReducedSolve::Direct,
+      )
+      .unwrap_err();
+      assert!(matches!(
+        error,
+        PetscError::InvalidRequestedEigenpairs {
+          requested: actual,
+          dimension: 3
+        } if actual == requested
+      ));
+    }
+  }
+
+  #[test]
+  fn typed_ghep_reduced_distinguishes_shape_and_convergence_failures() {
+    let binary = Path::new("/test/ghep_reduced.out");
+    let workspace = Path::new("/test/workspace");
+    let shape_error = validate_reduced_generalized_eigenproblem_output(
+      &Vector::from_vec(vec![1.0, 2.0]),
+      &Matrix::zeros(2, 1),
+      &Matrix::zeros(3, 2),
+      2,
+      3,
+      2,
+      binary,
+      workspace,
+    )
+    .unwrap_err();
+    assert!(matches!(
+      shape_error,
+      PetscError::InvalidReducedHelperOutputShape { .. }
+    ));
+
+    let convergence_error = validate_reduced_generalized_eigenproblem_output(
+      &Vector::from_vec(vec![1.0]),
+      &Matrix::zeros(2, 1),
+      &Matrix::zeros(3, 1),
+      2,
+      3,
+      2,
+      binary,
+      workspace,
+    )
+    .unwrap_err();
+    assert!(matches!(
+      convergence_error,
+      PetscError::InsufficientReducedEigenpairConvergence {
+        requested: 2,
+        converged: 1,
+        ..
+      }
+    ));
+  }
+
+  #[test]
+  #[ignore = "requires built PETSc/SLEPc ghep_reduced helper"]
+  fn typed_ghep_reduced_solves_bounded_sparse_problem_with_helper() {
+    let l = diagonal(&[1.0, 2.0, 4.0]);
+    let mk = diagonal(&[1.0, 1.0, 1.0]);
+    let mkm1 = diagonal(&[1.0, 1.0]);
+    let d = CsrMatrix::from(&CooMatrix::new(3, 2));
+    let c = CsrMatrix::from(&CooMatrix::new(2, 3));
+    let result = try_petsc_ghep_reduced_with_which(
+      GhepReducedOperators {
+        l: &l,
+        d: &d,
+        c: &c,
+        mkm1: &mkm1,
+        mk: &mk,
+      },
+      2,
+      GhiepWhich::Smallest,
+      GhiepReducedSolve::Direct,
+    )
+    .expect("bounded mixed helper solve should succeed");
+    assert_eq!(result.diagnostics.sigma_dimension, 2);
+    assert_eq!(result.diagnostics.u_dimension, 3);
+    assert_eq!(result.diagnostics.requested_rank, 2);
+    assert!(result.diagnostics.converged_rank >= 2);
+    assert_eq!(result.diagnostics.which, GhiepWhich::Smallest);
+    assert_eq!(result.diagnostics.mass_solve, GhiepReducedSolve::Direct);
+    assert_eq!(result.diagnostics.input_nonzeros, 8);
+    assert_eq!(result.sigma_eigenvectors.nrows(), 2);
+    assert_eq!(result.u_eigenvectors.nrows(), 3);
+    let mut eigenvalues = result.eigenvalues.iter().copied().collect::<Vec<_>>();
+    eigenvalues.sort_by(f64::total_cmp);
+    assert!((eigenvalues[0] - 1.0).abs() <= 1.0e-8);
+    assert!((eigenvalues[1] - 2.0).abs() <= 1.0e-8);
+    eprintln!(
+      "retained reduced PETSc helper workspace for inspection: {:?}",
+      result.diagnostics.workspace
+    );
   }
 
   #[test]
