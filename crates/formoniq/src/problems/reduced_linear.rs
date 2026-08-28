@@ -1,5 +1,6 @@
 use crate::assemble::{
   assemble_barycentric_dual_sparse_inverse_galmat_for_grade, assemble_galmat,
+  assemble_reduced_whitney_projected_sparse_inverse_galmat_for_grade,
   assemble_whitney_projected_sparse_inverse_galmat,
   assemble_whitney_projected_sparse_inverse_galmat_for_grade,
   assemble_whitney_projected_sparse_inverse_galmat_weighted, BarycentricDualSparseInverseConfig,
@@ -18,7 +19,15 @@ use std::collections::{BTreeMap, BTreeSet};
 pub enum MassInverseApproximation {
   RowSumLumped,
   WhitneyProjected,
+  /// Reduce the full-polynomial auxiliary coefficient space compatibly with
+  /// the active Whitney layout before inverting its lumped vertex blocks.
+  WhitneyProjectedBoundaryFirst,
   BarycentricDual(BarycentricDualSparseInverseConfig),
+  /// Dense diagnostic reference obtained by inverting the reduced consistent
+  /// Whitney mass. The explicit limit prevents accidental large-scale use.
+  ExactReducedConsistent {
+    maximum_dimension: usize,
+  },
   ExactTopDegreeDiagonal,
 }
 
@@ -62,6 +71,10 @@ pub fn assemble_mass_inverse(
         &assemble_whitney_projected_sparse_inverse_galmat_for_grade(topology, geometry, grade),
       ))
     }
+    MassInverseApproximation::WhitneyProjectedBoundaryFirst
+    | MassInverseApproximation::ExactReducedConsistent { .. } => Err(format!(
+      "{approximation:?} requires a compatible reduced Whitney layout and is available only through assemble_reduced_hodge_operators"
+    )),
     MassInverseApproximation::BarycentricDual(config) => {
       let coords =
         coords.ok_or_else(|| "barycentric-dual inverse requires mesh coordinates".to_string())?;
@@ -136,8 +149,32 @@ pub fn assemble_reduced_hodge_operators(
   let (mass_sigma, a12, a21, codifdif) =
     split_reduced_mixed_blocks(&mixed, reduced_sigma_len, reduced_u_len);
   let lower_layout = DofLayout::from_prescribed(galmats.sigma_len(), boundary.auxiliary.clone())?;
-  let lower_full = assemble_mass_inverse(topology, geometry, coords, grade - 1, lower_inverse)?;
-  let lower_reduced = reduce_square_with_layout(&lower_full, &lower_layout)?;
+  let lower_reduced = match lower_inverse {
+    MassInverseApproximation::WhitneyProjectedBoundaryFirst => CsrMatrix::from(
+      &assemble_reduced_whitney_projected_sparse_inverse_galmat_for_grade(
+        topology,
+        geometry,
+        grade - 1,
+        &lower_layout,
+      )?,
+    ),
+    MassInverseApproximation::ExactReducedConsistent { maximum_dimension } => {
+      if mass_sigma.nrows() > maximum_dimension {
+        return Err(format!(
+          "exact reduced consistent inverse requires {} auxiliary dofs, exceeding maximum_dimension {maximum_dimension}",
+          mass_sigma.nrows()
+        ));
+      }
+      let dense = Matrix::from(&mass_sigma)
+        .try_inverse()
+        .ok_or_else(|| "reduced consistent auxiliary mass must be invertible".to_string())?;
+      dense_to_csr(&dense)
+    }
+    _ => {
+      let lower_full = assemble_mass_inverse(topology, geometry, coords, grade - 1, lower_inverse)?;
+      reduce_square_with_layout(&lower_full, &lower_layout)?
+    }
+  };
   if lower_reduced.nrows() != mass_sigma.nrows() {
     return Err(format!(
       "lower-form inverse dimension {} does not match reduced auxiliary dimension {}",
@@ -551,6 +588,19 @@ fn diag_matrix(diag: &[f64]) -> CsrMatrix {
   CsrMatrix::from(&coo)
 }
 
+fn dense_to_csr(matrix: &Matrix) -> CsrMatrix {
+  let mut coo = CooMatrix::new(matrix.nrows(), matrix.ncols());
+  for row in 0..matrix.nrows() {
+    for col in 0..matrix.ncols() {
+      let value = matrix[(row, col)];
+      if value != 0.0 {
+        coo.push(row, col, value);
+      }
+    }
+  }
+  CsrMatrix::from(&coo)
+}
+
 fn scale_matrix(matrix: &CsrMatrix, scale: f64) -> CsrMatrix {
   let mut coo = CooMatrix::new(matrix.nrows(), matrix.ncols());
   for (row, col, value) in matrix.triplet_iter() {
@@ -669,6 +719,77 @@ mod tests {
     assert_eq!(lower.ncols(), topology.nsimplices(1));
     assert_eq!(assembled.state_mass_inverse.nrows(), topology.nsimplices(2));
     assert_eq!(assembled.state_mass_inverse.ncols(), topology.nsimplices(2));
+  }
+
+  #[test]
+  fn boundary_first_and_exact_reduced_lower_inverses_share_the_relative_layout() {
+    let mesh = CartesianMeshInfo::new_unit_scaled(3, 2, 1.0);
+    let (topology, coords) = mesh.compute_coord_complex();
+    let geometry = coords.to_edge_lengths(&topology);
+    let boundary = EssentialBoundarySpec {
+      state: topology
+        .boundary_subcomplex_simplices(2)
+        .into_iter()
+        .map(|simplex| PrescribedDof {
+          index: simplex.kidx,
+          value: 0.0,
+        })
+        .collect(),
+      auxiliary: topology
+        .boundary_subcomplex_simplices(1)
+        .into_iter()
+        .map(|simplex| PrescribedDof {
+          index: simplex.kidx,
+          value: 0.0,
+        })
+        .collect(),
+    };
+
+    let boundary_first = assemble_reduced_hodge_operators(
+      &topology,
+      &geometry,
+      Some(&coords),
+      2,
+      &boundary,
+      Some(MassInverseApproximation::WhitneyProjectedBoundaryFirst),
+      MassInverseApproximation::WhitneyProjected,
+    )
+    .unwrap();
+    let exact = assemble_reduced_hodge_operators(
+      &topology,
+      &geometry,
+      Some(&coords),
+      2,
+      &boundary,
+      Some(MassInverseApproximation::ExactReducedConsistent {
+        maximum_dimension: topology.edges().len(),
+      }),
+      MassInverseApproximation::WhitneyProjected,
+    )
+    .unwrap();
+
+    assert_eq!(boundary_first.layout, exact.layout);
+    let boundary_first_lower = boundary_first.lower_mass_inverse.unwrap();
+    let exact_lower = exact.lower_mass_inverse.unwrap();
+    assert_eq!(boundary_first_lower.nrows(), exact_lower.nrows());
+    assert!(dense_from_sparse(&boundary_first_lower)
+      .cholesky()
+      .is_some());
+    assert!(dense_from_sparse(&exact_lower).cholesky().is_some());
+
+    let error = assemble_reduced_hodge_operators(
+      &topology,
+      &geometry,
+      Some(&coords),
+      2,
+      &boundary,
+      Some(MassInverseApproximation::ExactReducedConsistent {
+        maximum_dimension: 1,
+      }),
+      MassInverseApproximation::WhitneyProjected,
+    )
+    .unwrap_err();
+    assert!(error.contains("exceeding maximum_dimension"));
   }
 
   #[test]
