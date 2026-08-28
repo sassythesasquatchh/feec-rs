@@ -18,6 +18,12 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Clone, Copy)]
 pub enum MassInverseApproximation {
   RowSumLumped,
+  /// Full-polynomial vertex-block inverse retracted to the Whitney space.
+  ///
+  /// At degree zero the full and trimmed `P1 Lambda0` spaces coincide, so the
+  /// retraction is the identity. The resulting vertex-quadrature inverse is
+  /// still an approximate sparse metric inverse, not the inverse of the
+  /// consistent mass matrix.
   WhitneyProjected,
   /// Reduce the full-polynomial auxiliary coefficient space compatibly with
   /// the active Whitney layout before inverting its lumped vertex blocks.
@@ -61,9 +67,9 @@ pub fn assemble_mass_inverse(
   match approximation {
     MassInverseApproximation::RowSumLumped => Ok(diag_matrix(&invert_diag(&lumped_diag(&mass)))),
     MassInverseApproximation::WhitneyProjected => {
-      if grade == 0 || grade == topology.dim() {
+      if grade != 0 && grade == topology.dim() {
         return Err(format!(
-          "Whitney-projected inverse requires 0 < grade < {}, got {grade}",
+          "Whitney-projected inverse requires grade = 0 or 0 < grade < {}, got {grade}",
           topology.dim()
         ));
       }
@@ -637,6 +643,7 @@ mod tests {
     let geometry = coords.to_edge_lengths(&topology);
     let cases = [
       (0, MassInverseApproximation::RowSumLumped),
+      (0, MassInverseApproximation::WhitneyProjected),
       (1, MassInverseApproximation::WhitneyProjected),
       (
         1,
