@@ -6,11 +6,13 @@ use formoniq::{
     assemble_nc1_lumped_mass_galmat_weighted, assemble_nc1_lumped_mass_inverse_galmat,
     assemble_nc1_lumped_mass_inverse_galmat_weighted, assemble_nc1_mass_galmat,
     assemble_nc1_mass_galmat_weighted, assemble_nc1_to_whitney_projection_galmat,
+    assemble_reduced_whitney_projected_sparse_inverse_galmat,
     assemble_whitney_projected_sparse_inverse_galmat,
     assemble_whitney_projected_sparse_inverse_galmat_weighted,
     assemble_whitney_to_nc1_embedding_galmat,
   },
   operators::{HodgeMassElmat, InnerProductWeightClosure},
+  reduction::{DofLayout, PrescribedDof},
 };
 use manifold::{
   gen::cartesian::CartesianMeshInfo,
@@ -122,6 +124,27 @@ fn edges_share_vertex(topology: &Complex, iedge: usize, jedge: usize) -> bool {
   let edge_i = topology.edges().handle_by_kidx(iedge);
   let edge_j = topology.edges().handle_by_kidx(jedge);
   edge_i.iter().any(|vertex| edge_j.contains(vertex))
+}
+
+fn homogeneous_boundary_edge_layout(topology: &Complex) -> DofLayout {
+  DofLayout::from_prescribed(
+    topology.edges().len(),
+    topology
+      .boundary_subcomplex_simplices(1)
+      .into_iter()
+      .map(|edge| PrescribedDof {
+        index: edge.kidx,
+        value: 0.0,
+      })
+      .collect(),
+  )
+  .unwrap()
+}
+
+fn principal_submatrix(matrix: &Matrix, active: &[usize]) -> Matrix {
+  Matrix::from_fn(active.len(), active.len(), |row, col| {
+    matrix[(active[row], active[col])]
+  })
 }
 
 #[test]
@@ -335,6 +358,61 @@ fn projected_sparse_inverse_is_symmetric_positive_diagonal_and_vertex_local() {
       }
     }
   }
+}
+
+#[test]
+fn reduced_projected_inverse_identity_layout_matches_full_assembly() {
+  let (topology, _, metric) = cartesian_metric_complex(3, 1);
+  let layout = DofLayout::identity(topology.edges().len());
+  let reduced = Matrix::from(
+    &assemble_reduced_whitney_projected_sparse_inverse_galmat(&topology, &metric, &layout).unwrap(),
+  );
+  let full = Matrix::from(&assemble_whitney_projected_sparse_inverse_galmat(
+    &topology, &metric,
+  ));
+
+  assert_relative_eq!(reduced, full, epsilon = 1e-12, max_relative = 1e-12);
+}
+
+#[test]
+fn boundary_first_projected_inverse_is_spd_local_and_not_posthoc_restriction() {
+  let (topology, _, metric) = cartesian_metric_complex(3, 2);
+  let layout = homogeneous_boundary_edge_layout(&topology);
+  assert!(!layout.active_dofs.is_empty());
+
+  let boundary_first = Matrix::from(
+    &assemble_reduced_whitney_projected_sparse_inverse_galmat(&topology, &metric, &layout).unwrap(),
+  );
+  let full = Matrix::from(&assemble_whitney_projected_sparse_inverse_galmat(
+    &topology, &metric,
+  ));
+  let posthoc = principal_submatrix(&full, &layout.active_dofs);
+
+  assert!(boundary_first.clone().cholesky().is_some());
+  assert!((&boundary_first - posthoc).norm() > 1e-10);
+
+  for (reduced_i, &full_i) in layout.active_dofs.iter().enumerate() {
+    for (reduced_j, &full_j) in layout.active_dofs.iter().enumerate() {
+      if !edges_share_vertex(&topology, full_i, full_j) {
+        assert_relative_eq!(
+          boundary_first[(reduced_i, reduced_j)],
+          0.0,
+          epsilon = 1e-12,
+          max_relative = 1e-12
+        );
+      }
+    }
+  }
+}
+
+#[test]
+fn reduced_projected_inverse_rejects_a_layout_for_another_space() {
+  let (topology, _, metric) = cartesian_metric_complex(3, 1);
+  let invalid = DofLayout::identity(topology.edges().len() + 1);
+  let error =
+    assemble_reduced_whitney_projected_sparse_inverse_galmat(&topology, &metric, &invalid)
+      .unwrap_err();
+  assert!(error.contains("full dimension"));
 }
 
 #[test]
