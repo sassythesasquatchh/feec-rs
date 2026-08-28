@@ -3,6 +3,7 @@ extern crate nalgebra_sparse as nas;
 
 pub mod assemble;
 pub mod fe;
+pub mod full_p1;
 pub mod io;
 pub mod mixed_bc_hodge_laplacian_convergence;
 pub mod operators;
