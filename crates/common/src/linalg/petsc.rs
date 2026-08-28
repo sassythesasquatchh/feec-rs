@@ -424,7 +424,7 @@ pub struct PetscGeneralizedEigenpairs {
 }
 
 /// Diagnostics for one sparse mixed/reduced generalized Hodge helper run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PetscReducedGeneralizedEigenDiagnostics {
   pub sigma_dimension: usize,
   pub u_dimension: usize,
@@ -438,6 +438,7 @@ pub struct PetscReducedGeneralizedEigenDiagnostics {
   pub input_nonzeros: usize,
   pub which: GhiepWhich,
   pub mass_solve: GhiepReducedSolve,
+  pub eigensolver_tolerance: f64,
   pub workspace: PathBuf,
   pub binary: PathBuf,
 }
@@ -625,7 +626,7 @@ fn ghep_reduced_args(
     "-eps_nev".into(),
     neigen_values.to_string(),
     "-eps_tol".into(),
-    "1e-10".into(),
+    GHEP_REDUCED_EPS_TOLERANCE.to_string(),
   ];
 
   match which {
@@ -690,6 +691,8 @@ fn ghep_reduced_args(
 
   args
 }
+
+const GHEP_REDUCED_EPS_TOLERANCE: f64 = 1.0e-10;
 
 /// Choose a bounded Krylov--Schur search-space dimension for a partial solve.
 ///
@@ -1037,6 +1040,7 @@ pub fn try_petsc_ghep_reduced_with_which(
       input_nonzeros,
       which,
       mass_solve,
+      eigensolver_tolerance: GHEP_REDUCED_EPS_TOLERANCE,
       workspace,
       binary,
     },
@@ -1417,6 +1421,14 @@ mod tests {
   #[test]
   fn ghep_reduced_args_direct_uses_lu() {
     let args = ghep_reduced_args(GhiepWhich::Largest, 4, 100, GhiepReducedSolve::Direct);
+    let tolerance_index = args
+      .iter()
+      .position(|argument| argument == "-eps_tol")
+      .expect("reduced eigensolver must pass an explicit tolerance");
+    assert_eq!(
+      args.get(tolerance_index + 1),
+      Some(&GHEP_REDUCED_EPS_TOLERANCE.to_string())
+    );
     assert!(args.iter().any(|arg| arg == "-mkm1_ksp_type"));
     assert!(args.iter().any(|arg| arg == "preonly"));
     assert!(args.iter().any(|arg| arg == "-mkm1_pc_type"));
