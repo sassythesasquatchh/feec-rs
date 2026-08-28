@@ -1,3 +1,5 @@
+use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
@@ -115,45 +117,60 @@ fn run_petsc_command<S>(binary: &Path, current_dir: &Path, args: &[S]) -> std::p
 where
   S: AsRef<std::ffi::OsStr>,
 {
+  try_run_petsc_command(binary, current_dir, args).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn create_petsc_workspace(solver_path: &Path) -> PathBuf {
+  try_create_petsc_workspace(solver_path).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn try_run_petsc_command<S>(
+  binary: &Path,
+  current_dir: &Path,
+  args: &[S],
+) -> Result<std::process::ExitStatus, PetscError>
+where
+  S: AsRef<std::ffi::OsStr>,
+{
   std::process::Command::new(binary)
     .current_dir(current_dir)
     .args(args)
     .status()
-    .unwrap_or_else(|error| {
-      panic!(
-        "failed to launch PETSc helper {:?} in {:?}: {}",
-        binary, current_dir, error
-      )
+    .map_err(|source| PetscError::HelperLaunch {
+      binary: binary.to_path_buf(),
+      workspace: current_dir.to_path_buf(),
+      source,
     })
 }
 
-fn create_petsc_workspace(solver_path: &Path) -> PathBuf {
-  let workspace_id = PETSC_WORKSPACE_COUNTER.fetch_add(1, Ordering::Relaxed);
-  let workspace = solver_path
-    .join("tmp")
-    .join(format!("run-{}-{workspace_id}", std::process::id()));
+fn try_create_petsc_workspace(solver_path: &Path) -> Result<PathBuf, PetscError> {
+  let workspace_root = solver_path.join("tmp");
+  std::fs::create_dir_all(&workspace_root).map_err(|source| PetscError::WorkspaceCreate {
+    path: workspace_root.clone(),
+    source,
+  })?;
 
-  if workspace.exists() {
-    std::fs::remove_dir_all(&workspace)
-      .unwrap_or_else(|error| panic!("failed to clear PETSc workspace {:?}: {}", workspace, error));
+  loop {
+    let workspace_id = PETSC_WORKSPACE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let workspace = workspace_root.join(format!("run-{}-{workspace_id}", std::process::id()));
+    match std::fs::create_dir(&workspace) {
+      Ok(()) => {
+        for child in ["in", "out"] {
+          let path = workspace.join(child);
+          std::fs::create_dir(&path)
+            .map_err(|source| PetscError::WorkspaceCreate { path, source })?;
+        }
+        return Ok(workspace);
+      }
+      Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+      Err(source) => {
+        return Err(PetscError::WorkspaceCreate {
+          path: workspace,
+          source,
+        })
+      }
+    }
   }
-
-  std::fs::create_dir_all(workspace.join("in")).unwrap_or_else(|error| {
-    panic!(
-      "failed to create PETSc workspace input dir {:?}: {}",
-      workspace.join("in"),
-      error
-    )
-  });
-  std::fs::create_dir_all(workspace.join("out")).unwrap_or_else(|error| {
-    panic!(
-      "failed to create PETSc workspace output dir {:?}: {}",
-      workspace.join("out"),
-      error
-    )
-  });
-
-  workspace
 }
 
 const PETSC_MAT_FILE_CLASSID: i32 = 1211216;
@@ -169,6 +186,167 @@ pub enum GhiepWhich {
 pub enum GhiepReducedSolve {
   Direct,
   Iterative,
+}
+
+/// Typed failures from the external PETSc/SLEPc helper boundary.
+#[derive(Debug)]
+pub enum PetscError {
+  InvalidGeneralizedEigenproblemDimensions {
+    lhs_rows: usize,
+    lhs_cols: usize,
+    rhs_rows: usize,
+    rhs_cols: usize,
+  },
+  InvalidRequestedEigenpairs {
+    requested: usize,
+    dimension: usize,
+  },
+  NonFiniteInputEntry {
+    operator: &'static str,
+    row: usize,
+    col: usize,
+    value: f64,
+  },
+  WorkspaceCreate {
+    path: PathBuf,
+    source: io::Error,
+  },
+  InputWrite {
+    binary: PathBuf,
+    workspace: PathBuf,
+    path: PathBuf,
+    source: io::Error,
+  },
+  HelperLaunch {
+    binary: PathBuf,
+    workspace: PathBuf,
+    source: io::Error,
+  },
+  HelperExit {
+    binary: PathBuf,
+    workspace: PathBuf,
+    status: std::process::ExitStatus,
+  },
+  OutputRead {
+    binary: PathBuf,
+    workspace: PathBuf,
+    path: PathBuf,
+    source: io::Error,
+  },
+  InvalidHelperOutput {
+    binary: PathBuf,
+    workspace: PathBuf,
+    detail: String,
+  },
+}
+
+impl fmt::Display for PetscError {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::InvalidGeneralizedEigenproblemDimensions {
+        lhs_rows,
+        lhs_cols,
+        rhs_rows,
+        rhs_cols,
+      } => write!(
+        formatter,
+        "PETSc generalized eigenproblem requires matching square matrices, got lhs {lhs_rows}x{lhs_cols} and rhs {rhs_rows}x{rhs_cols}"
+      ),
+      Self::InvalidRequestedEigenpairs {
+        requested,
+        dimension,
+      } => write!(
+        formatter,
+        "PETSc generalized eigenproblem rank must be in 1..={dimension}, got {requested}"
+      ),
+      Self::NonFiniteInputEntry {
+        operator,
+        row,
+        col,
+        value,
+      } => write!(
+        formatter,
+        "PETSc generalized eigenproblem {operator} entry ({row}, {col}) is non-finite: {value}"
+      ),
+      Self::WorkspaceCreate { path, source } => {
+        write!(formatter, "failed to create PETSc workspace {path:?}: {source}")
+      }
+      Self::InputWrite {
+        binary,
+        workspace,
+        path,
+        source,
+      } => write!(
+        formatter,
+        "failed to write PETSc helper input {path:?} for binary {binary:?} in workspace {workspace:?}: {source}"
+      ),
+      Self::HelperLaunch {
+        binary,
+        workspace,
+        source,
+      } => write!(
+        formatter,
+        "failed to launch PETSc helper {binary:?} in workspace {workspace:?}: {source}"
+      ),
+      Self::HelperExit {
+        binary,
+        workspace,
+        status,
+      } => write!(
+        formatter,
+        "PETSc helper {binary:?} exited with {status} in workspace {workspace:?}"
+      ),
+      Self::OutputRead {
+        binary,
+        workspace,
+        path,
+        source,
+      } => write!(
+        formatter,
+        "failed to read PETSc helper output {path:?} from binary {binary:?} in workspace {workspace:?}: {source}"
+      ),
+      Self::InvalidHelperOutput {
+        binary,
+        workspace,
+        detail,
+      } => write!(
+        formatter,
+        "invalid PETSc helper output from binary {binary:?} in workspace {workspace:?}: {detail}"
+      ),
+    }
+  }
+}
+
+impl std::error::Error for PetscError {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    match self {
+      Self::WorkspaceCreate { source, .. }
+      | Self::InputWrite { source, .. }
+      | Self::HelperLaunch { source, .. }
+      | Self::OutputRead { source, .. } => Some(source),
+      _ => None,
+    }
+  }
+}
+
+/// Diagnostics for one partial generalized Hermitian eigenproblem helper run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PetscGeneralizedEigenDiagnostics {
+  pub dimension: usize,
+  pub requested_rank: usize,
+  pub converged_rank: usize,
+  pub lhs_nonzeros: usize,
+  pub rhs_nonzeros: usize,
+  pub workspace: PathBuf,
+  pub binary: PathBuf,
+}
+
+/// Partial generalized eigenpairs plus the exact helper/run context.
+#[derive(Debug)]
+pub struct PetscGeneralizedEigenpairs {
+  pub eigenvalues: Vector,
+  pub eigenvectors: Matrix,
+  pub diagnostics: PetscGeneralizedEigenDiagnostics,
 }
 
 pub fn petsc_write_matrix(matrix: &CsrMatrix, filename: &str) -> std::io::Result<()> {
@@ -226,9 +404,14 @@ pub fn petsc_read_vector(filename: &str) -> std::io::Result<Vector> {
   let mut reader = BufReader::new(file);
 
   let magic = reader.read_i32::<BigEndian>()?;
-  assert_eq!(magic, PETSC_VEC_FILE_CLASSID);
+  if magic != PETSC_VEC_FILE_CLASSID {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidData,
+      format!("invalid PETSc vector class id {magic}"),
+    ));
+  }
 
-  let nrows = reader.read_i32::<BigEndian>()? as usize;
+  let nrows = read_nonnegative_i32(&mut reader, "PETSc vector row count")?;
 
   let mut vector = Vector::zeros(nrows);
   for i in 0..nrows {
@@ -242,7 +425,7 @@ pub fn petsc_read_eigenvals(filename: &str) -> std::io::Result<Vector> {
   let file = File::open(filename)?;
   let mut reader = BufReader::new(file);
 
-  let neigenvals = reader.read_i32::<BigEndian>()? as usize;
+  let neigenvals = read_nonnegative_i32(&mut reader, "PETSc eigenvalue count")?;
   let mut eigenvals = Vector::zeros(neigenvals);
 
   for i in 0..neigenvals {
@@ -256,22 +439,48 @@ pub fn petsc_read_eigenvecs(filename: &str) -> std::io::Result<nalgebra::DMatrix
   let file = File::open(filename)?;
   let mut reader = BufReader::new(file);
 
-  let nrows = reader.read_i32::<BigEndian>()? as usize;
-  let ncols = reader.read_i32::<BigEndian>()? as usize;
+  let nrows = read_nonnegative_i32(&mut reader, "PETSc eigenvector row count")?;
+  let ncols = read_nonnegative_i32(&mut reader, "PETSc eigenvector column count")?;
+  let entry_count = nrows.checked_mul(ncols).ok_or_else(|| {
+    io::Error::new(
+      io::ErrorKind::InvalidData,
+      "PETSc eigenvector dimensions overflow usize",
+    )
+  })?;
 
-  let mut data = Vec::with_capacity(nrows * ncols);
+  let mut data = Vec::with_capacity(entry_count);
   for _ in 0..ncols {
     let magic = reader.read_i32::<BigEndian>()?;
-    assert_eq!(magic, PETSC_VEC_FILE_CLASSID);
+    if magic != PETSC_VEC_FILE_CLASSID {
+      return Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("invalid PETSc eigenvector class id {magic}"),
+      ));
+    }
 
-    let this_nrows = reader.read_i32::<BigEndian>()? as usize;
-    assert_eq!(this_nrows, nrows);
+    let this_nrows = read_nonnegative_i32(&mut reader, "PETSc eigenvector row count")?;
+    if this_nrows != nrows {
+      return Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("PETSc eigenvector column has {this_nrows} rows, expected {nrows}"),
+      ));
+    }
 
     for _ in 0..nrows {
       data.push(reader.read_f64::<BigEndian>()?);
     }
   }
   Ok(Matrix::from_column_slice(nrows, ncols, &data))
+}
+
+fn read_nonnegative_i32(reader: &mut impl ReadBytesExt, field: &'static str) -> io::Result<usize> {
+  let value = reader.read_i32::<BigEndian>()?;
+  usize::try_from(value).map_err(|_| {
+    io::Error::new(
+      io::ErrorKind::InvalidData,
+      format!("{field} must be non-negative, got {value}"),
+    )
+  })
 }
 
 fn ghiep_args(which: GhiepWhich, neigen_values: usize) -> Vec<String> {
@@ -385,29 +594,79 @@ pub fn petsc_ghiep_with_which(
   neigen_values: usize,
   which: GhiepWhich,
 ) -> (Vector, Matrix) {
+  let result = try_petsc_ghiep_with_which(lhs, rhs, neigen_values, which)
+    .unwrap_or_else(|error| panic!("{error}"));
+  (result.eigenvalues, result.eigenvectors)
+}
+
+/// Solve a partial generalized Hermitian eigenproblem without panicking.
+///
+/// The helper solves `lhs * v = lambda * rhs * v`. Both matrices must be
+/// finite, square, and defined on the same coefficient space. The unique
+/// workspace is intentionally retained and returned in diagnostics so failed
+/// or suspicious external runs can be inspected; this function never removes
+/// a pre-existing workspace and never falls back to a dense solver.
+pub fn try_petsc_ghiep_with_which(
+  lhs: &CsrMatrix,
+  rhs: &CsrMatrix,
+  neigen_values: usize,
+  which: GhiepWhich,
+) -> Result<PetscGeneralizedEigenpairs, PetscError> {
+  validate_generalized_eigenproblem(lhs, rhs, neigen_values)?;
   let solver_path = petsc_solver_path();
-  let workspace = create_petsc_workspace(&solver_path);
-
-  let path = workspace.join("in");
-  petsc_write_matrix(lhs, path.join("A.bin").to_str().unwrap()).unwrap();
-  petsc_write_matrix(rhs, path.join("B.bin").to_str().unwrap()).unwrap();
-
   let binary = solver_path.join("ghiep.out");
+  let workspace = try_create_petsc_workspace(&solver_path)?;
+
+  let input_path = workspace.join("in");
+  write_generalized_eigenproblem_input(lhs, &input_path.join("A.bin"), &binary, &workspace)?;
+  write_generalized_eigenproblem_input(rhs, &input_path.join("B.bin"), &binary, &workspace)?;
+
   let args = ghiep_args(which, neigen_values);
 
-  let status = run_petsc_command(&binary, &workspace, &args);
-  assert!(status.success());
+  let status = try_run_petsc_command(&binary, &workspace, &args)?;
+  if !status.success() {
+    return Err(PetscError::HelperExit {
+      binary,
+      workspace,
+      status,
+    });
+  }
 
-  let eigenvals =
-    petsc_read_eigenvals(workspace.join("out/eigenvals.bin").to_str().unwrap()).unwrap();
-  let eigenvecs =
-    petsc_read_eigenvecs(workspace.join("out/eigenvecs.bin").to_str().unwrap()).unwrap();
+  let eigenvalue_path = workspace.join("out/eigenvals.bin");
+  let eigenvector_path = workspace.join("out/eigenvecs.bin");
+  let eigenvalues = read_eigenvalues_with_context(&eigenvalue_path, &binary, &workspace)?;
+  let eigenvectors = read_eigenvectors_with_context(&eigenvector_path, &binary, &workspace)?;
+  validate_generalized_eigenproblem_output(
+    &eigenvalues,
+    &eigenvectors,
+    lhs.nrows(),
+    &binary,
+    &workspace,
+  )?;
 
-  let k = neigen_values.min(eigenvals.len());
+  let converged_rank = eigenvalues.len();
+  Ok(PetscGeneralizedEigenpairs {
+    eigenvalues,
+    eigenvectors,
+    diagnostics: PetscGeneralizedEigenDiagnostics {
+      dimension: lhs.nrows(),
+      requested_rank: neigen_values,
+      converged_rank,
+      lhs_nonzeros: lhs.nnz(),
+      rhs_nonzeros: rhs.nnz(),
+      workspace,
+      binary,
+    },
+  })
+}
 
-  let eigenvals = eigenvals.rows(0, k).into_owned();
-  let eigenvecs = eigenvecs.columns(0, k).into_owned();
-  (eigenvals, eigenvecs)
+/// Typed smallest-eigenvalue compatibility companion to [`petsc_ghiep`].
+pub fn try_petsc_ghiep(
+  lhs: &CsrMatrix,
+  rhs: &CsrMatrix,
+  neigen_values: usize,
+) -> Result<PetscGeneralizedEigenpairs, PetscError> {
+  try_petsc_ghiep_with_which(lhs, rhs, neigen_values, GhiepWhich::Smallest)
 }
 
 pub fn petsc_ghiep(lhs: &CsrMatrix, rhs: &CsrMatrix, neigen_values: usize) -> (Vector, Matrix) {
@@ -420,6 +679,122 @@ pub fn petsc_ghiep_largest(
   neigen_values: usize,
 ) -> (Vector, Matrix) {
   petsc_ghiep_with_which(lhs, rhs, neigen_values, GhiepWhich::Largest)
+}
+
+fn validate_generalized_eigenproblem(
+  lhs: &CsrMatrix,
+  rhs: &CsrMatrix,
+  requested_rank: usize,
+) -> Result<(), PetscError> {
+  if lhs.nrows() != lhs.ncols() || rhs.nrows() != rhs.ncols() || lhs.nrows() != rhs.nrows() {
+    return Err(PetscError::InvalidGeneralizedEigenproblemDimensions {
+      lhs_rows: lhs.nrows(),
+      lhs_cols: lhs.ncols(),
+      rhs_rows: rhs.nrows(),
+      rhs_cols: rhs.ncols(),
+    });
+  }
+  let dimension = lhs.nrows();
+  if requested_rank == 0 || requested_rank > dimension {
+    return Err(PetscError::InvalidRequestedEigenpairs {
+      requested: requested_rank,
+      dimension,
+    });
+  }
+  validate_finite_operator(lhs, "lhs")?;
+  validate_finite_operator(rhs, "rhs")?;
+  Ok(())
+}
+
+fn validate_finite_operator(operator: &CsrMatrix, name: &'static str) -> Result<(), PetscError> {
+  if let Some((row, col, value)) = operator
+    .triplet_iter()
+    .find(|(_, _, value)| !value.is_finite())
+  {
+    return Err(PetscError::NonFiniteInputEntry {
+      operator: name,
+      row,
+      col,
+      value: *value,
+    });
+  }
+  Ok(())
+}
+
+fn write_generalized_eigenproblem_input(
+  matrix: &CsrMatrix,
+  path: &Path,
+  binary: &Path,
+  workspace: &Path,
+) -> Result<(), PetscError> {
+  let filename = path.to_string_lossy();
+  petsc_write_matrix(matrix, &filename).map_err(|source| PetscError::InputWrite {
+    binary: binary.to_path_buf(),
+    workspace: workspace.to_path_buf(),
+    path: path.to_path_buf(),
+    source,
+  })
+}
+
+fn read_eigenvalues_with_context(
+  path: &Path,
+  binary: &Path,
+  workspace: &Path,
+) -> Result<Vector, PetscError> {
+  let filename = path.to_string_lossy();
+  petsc_read_eigenvals(&filename).map_err(|source| PetscError::OutputRead {
+    binary: binary.to_path_buf(),
+    workspace: workspace.to_path_buf(),
+    path: path.to_path_buf(),
+    source,
+  })
+}
+
+fn read_eigenvectors_with_context(
+  path: &Path,
+  binary: &Path,
+  workspace: &Path,
+) -> Result<Matrix, PetscError> {
+  let filename = path.to_string_lossy();
+  petsc_read_eigenvecs(&filename).map_err(|source| PetscError::OutputRead {
+    binary: binary.to_path_buf(),
+    workspace: workspace.to_path_buf(),
+    path: path.to_path_buf(),
+    source,
+  })
+}
+
+fn validate_generalized_eigenproblem_output(
+  eigenvalues: &Vector,
+  eigenvectors: &Matrix,
+  dimension: usize,
+  binary: &Path,
+  workspace: &Path,
+) -> Result<(), PetscError> {
+  let invalid = if eigenvalues.is_empty() {
+    Some("the helper returned no converged eigenpairs".to_string())
+  } else if eigenvectors.nrows() != dimension {
+    Some(format!(
+      "the eigenvector matrix has {} rows, expected {dimension}",
+      eigenvectors.nrows()
+    ))
+  } else if eigenvectors.ncols() != eigenvalues.len() {
+    Some(format!(
+      "the helper returned {} eigenvalues and {} eigenvector columns",
+      eigenvalues.len(),
+      eigenvectors.ncols()
+    ))
+  } else {
+    None
+  };
+  if let Some(detail) = invalid {
+    return Err(PetscError::InvalidHelperOutput {
+      binary: binary.to_path_buf(),
+      workspace: workspace.to_path_buf(),
+      detail,
+    });
+  }
+  Ok(())
 }
 
 /// Operators defining the reduced generalized Hodge eigenproblem.
@@ -588,6 +963,15 @@ fn direct_saddle_point_args() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::linalg::nalgebra::CooMatrix;
+
+  fn diagonal(values: &[f64]) -> CsrMatrix {
+    let mut coo = CooMatrix::new(values.len(), values.len());
+    for (index, value) in values.iter().copied().enumerate() {
+      coo.push(index, index, value);
+    }
+    CsrMatrix::from(&coo)
+  }
 
   fn assert_petsc_solver_sources_exist(path: &Path) {
     for source in ["Makefile", "ghiep.c", "ghep_reduced.c", "hils.c"] {
@@ -626,6 +1010,94 @@ mod tests {
     assert!(args.iter().any(|arg| arg == "-eps_largest_magnitude"));
     assert!(args.iter().any(|arg| arg == "3"));
     assert!(!args.iter().any(|arg| arg == "-st_type"));
+  }
+
+  #[test]
+  fn typed_ghiep_rejects_nonmatching_dimensions_before_launch() {
+    let lhs = diagonal(&[1.0, 2.0]);
+    let mut rhs_coo = CooMatrix::new(2, 3);
+    rhs_coo.push(0, 0, 1.0);
+    rhs_coo.push(1, 1, 1.0);
+    let rhs = CsrMatrix::from(&rhs_coo);
+    let error = try_petsc_ghiep(&lhs, &rhs, 1).unwrap_err();
+    assert!(matches!(
+      error,
+      PetscError::InvalidGeneralizedEigenproblemDimensions { .. }
+    ));
+  }
+
+  #[test]
+  fn typed_ghiep_rejects_zero_and_oversized_rank_before_launch() {
+    let lhs = diagonal(&[1.0, 2.0]);
+    let rhs = diagonal(&[1.0, 1.0]);
+    for requested in [0, 3] {
+      let error = try_petsc_ghiep(&lhs, &rhs, requested).unwrap_err();
+      assert!(matches!(
+        error,
+        PetscError::InvalidRequestedEigenpairs {
+          requested: actual,
+          dimension: 2
+        } if actual == requested
+      ));
+    }
+  }
+
+  #[test]
+  fn typed_ghiep_rejects_nonfinite_input_before_launch() {
+    let lhs = diagonal(&[1.0, f64::NAN]);
+    let rhs = diagonal(&[1.0, 1.0]);
+    let error = try_petsc_ghiep(&lhs, &rhs, 1).unwrap_err();
+    assert!(matches!(
+      error,
+      PetscError::NonFiniteInputEntry {
+        operator: "lhs",
+        row: 1,
+        col: 1,
+        value
+      } if value.is_nan()
+    ));
+  }
+
+  #[test]
+  fn typed_helper_launch_error_contains_binary_and_workspace() {
+    let binary = PathBuf::from("/definitely/missing/ghiep.out");
+    let workspace = PathBuf::from("/definitely/missing/workspace");
+    let error = try_run_petsc_command(&binary, &workspace, &[] as &[&str]).unwrap_err();
+    match error {
+      PetscError::HelperLaunch {
+        binary: actual_binary,
+        workspace: actual_workspace,
+        ..
+      } => {
+        assert_eq!(actual_binary, binary);
+        assert_eq!(actual_workspace, workspace);
+      }
+      other => panic!("expected helper launch error, got {other}"),
+    }
+  }
+
+  #[test]
+  #[ignore = "requires built PETSc/SLEPc ghiep helper"]
+  fn typed_ghiep_solves_bounded_diagonal_problem_with_helper() {
+    let lhs = diagonal(&[1.0, 2.0, 4.0]);
+    let rhs = diagonal(&[1.0, 1.0, 1.0]);
+    let result = try_petsc_ghiep(&lhs, &rhs, 2).expect("bounded helper solve should succeed");
+    assert_eq!(result.diagnostics.dimension, 3);
+    assert_eq!(result.diagnostics.requested_rank, 2);
+    assert!(result.diagnostics.converged_rank >= 2);
+    assert_eq!(result.eigenvectors.nrows(), 3);
+    assert_eq!(
+      result.eigenvectors.ncols(),
+      result.diagnostics.converged_rank
+    );
+    let mut eigenvalues = result.eigenvalues.iter().copied().collect::<Vec<_>>();
+    eigenvalues.sort_by(f64::total_cmp);
+    assert!((eigenvalues[0] - 1.0).abs() <= 1.0e-8);
+    assert!((eigenvalues[1] - 2.0).abs() <= 1.0e-8);
+    eprintln!(
+      "retained PETSc helper workspace for inspection: {:?}",
+      result.diagnostics.workspace
+    );
   }
 
   #[test]
