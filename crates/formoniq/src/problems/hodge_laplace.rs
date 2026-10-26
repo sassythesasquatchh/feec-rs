@@ -798,13 +798,34 @@ pub fn solve_hodge_laplace_harmonics_with_galmats(
     k_strong_bc_predicate,
   );
 
-  if !eigenvals.iter().all(|&eigenval| eigenval <= 1e-12) {
-    panic!(
-      "Expected zero eigenvalues for harmonic forms, but got eigenvalues: {:?}",
-      eigenvals
-    );
-  }
-  harmonics
+  select_harmonic_eigenvectors(&eigenvals, &harmonics, homology_dim)
+}
+
+fn select_harmonic_eigenvectors(
+  eigenvals: &Vector,
+  eigenvectors: &Matrix,
+  homology_dim: usize,
+) -> Matrix {
+  assert_eq!(eigenvals.len(), eigenvectors.ncols());
+  assert!(
+    eigenvals.len() >= homology_dim,
+    "Harmonic eigensolver returned fewer eigenpairs than requested"
+  );
+  // SLEPc may converge additional positive modes beyond the requested rank.
+  // Keep only the requested nullspace and preserve its matching columns.
+  let mut indices = (0..eigenvals.len()).collect::<Vec<_>>();
+  indices.sort_by(|&i, &j| eigenvals[i].abs().total_cmp(&eigenvals[j].abs()));
+  indices.truncate(homology_dim);
+  assert!(
+    indices
+      .iter()
+      .all(|&i| eigenvals[i].is_finite() && eigenvals[i].abs() <= 1e-12),
+    "Expected zero eigenvalues for harmonic forms, but got eigenvalues: {:?}",
+    eigenvals
+  );
+  Matrix::from_fn(eigenvectors.nrows(), homology_dim, |row, column| {
+    eigenvectors[(row, indices[column])]
+  })
 }
 
 // Weighted metric data and the two grade-specific boundary restrictions define
@@ -1756,6 +1777,31 @@ pub fn fix_dofs_coeff_strong_coo_rectangular(
 mod tests {
   use super::*;
   use manifold::gen::cartesian::CartesianMeshInfo;
+
+  #[test]
+  fn harmonic_selection_ignores_extra_converged_positive_modes() {
+    let values = Vector::from_vec(vec![0.3, -1e-15, 2e-15, 0.7, 3e-15, -4e-15]);
+    let vectors = Matrix::identity(6, 6);
+    let harmonics = select_harmonic_eigenvectors(&values, &vectors, 4);
+    assert_eq!(harmonics.nrows(), 6);
+    assert_eq!(harmonics.ncols(), 4);
+    for (column, original) in [1, 2, 4, 5].into_iter().enumerate() {
+      assert_eq!(harmonics.column(column), vectors.column(original));
+    }
+  }
+
+  #[test]
+  #[should_panic(expected = "Expected zero eigenvalues for harmonic forms")]
+  fn harmonic_selection_rejects_nonzero_negative_modes() {
+    let values = Vector::from_vec(vec![-0.3, 1e-15, -2e-15]);
+    select_harmonic_eigenvectors(&values, &Matrix::identity(3, 3), 3);
+  }
+
+  #[test]
+  #[should_panic(expected = "fewer eigenpairs than requested")]
+  fn harmonic_selection_rejects_insufficient_convergence() {
+    select_harmonic_eigenvectors(&Vector::zeros(2), &Matrix::identity(2, 2), 4);
+  }
 
   #[cfg(feature = "external-solver-tests")]
   fn assert_vectors_close(lhs: &Vector, rhs: &Vector, tol: f64) {
