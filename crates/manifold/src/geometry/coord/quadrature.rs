@@ -100,6 +100,24 @@ impl SimplexQuadRule {
 }
 
 impl SimplexQuadRule {
+  /// Composite two-point Gauss--Legendre rule on the reference segment [0, 1].
+  /// Each of the equally sized panels integrates cubic polynomials exactly.
+  ///
+  /// # Panics
+  /// Panics when `panels` is zero.
+  pub fn segment_gauss_legendre(panels: usize) -> Self {
+    assert!(
+      panels > 0,
+      "the number of quadrature panels must be positive"
+    );
+    let points = Matrix::from_fn(1, 2 * panels, |_, i| {
+      let node = if i % 2 == 0 { -1.0 } else { 1.0 } / 3.0_f64.sqrt();
+      (i / 2) as f64 / panels as f64 + (1.0 + node) / (2 * panels) as f64
+    });
+    let weights = Vector::from_element(2 * panels, 1.0 / (2 * panels) as f64);
+    Self { points, weights }
+  }
+
   pub fn order3(dim: Dim) -> Self {
     match dim {
       0 => Self::dim0(),
@@ -144,6 +162,33 @@ mod tests {
   use super::*;
   use crate::geometry::refsimp_vol;
   use approx::assert_abs_diff_eq;
+
+  #[test]
+  fn composite_segment_gauss_rule_is_cubic_exact_and_resolves_smooth_fields() {
+    for panels in [1, 7, 32] {
+      let rule = SimplexQuadRule::segment_gauss_legendre(panels);
+      for power in 0..=3 {
+        let value = rule.integrate_local(&|p: CoordRef| p[0].powi(power), 1.0);
+        assert_abs_diff_eq!(value, 1.0 / (power + 1) as f64, epsilon = 1e-14);
+      }
+    }
+    let exact = std::f64::consts::E - 1.0;
+    let error = |panels| {
+      (SimplexQuadRule::segment_gauss_legendre(panels)
+        .integrate_local(&|p: CoordRef| p[0].exp(), 1.0)
+        - exact)
+        .abs()
+    };
+    assert!(error(32) < error(8));
+    let gauss_error_bound = std::f64::consts::E / (4320.0 * 32.0_f64.powi(4));
+    assert!(error(32) < gauss_error_bound);
+  }
+
+  #[test]
+  #[should_panic(expected = "must be positive")]
+  fn composite_segment_gauss_rule_rejects_zero_panels() {
+    SimplexQuadRule::segment_gauss_legendre(0);
+  }
 
   // Assume: type CoordRef<'a> = &'a na::DVectorSlice<'a, f64>;
 
