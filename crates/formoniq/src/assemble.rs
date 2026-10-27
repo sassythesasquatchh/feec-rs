@@ -2,6 +2,7 @@ use crate::operators::{
   ApplyWeight, CoordAwareElMatProvider, DofIdx, ElMatProvider, ElVecProvider,
   InnerProductWeightClosure, Nc1MassElmat, Nc2MassElmat, NcLumpedMassElmat,
 };
+use crate::reduction::DofLayout;
 
 use common::{
   linalg::nalgebra::{CooMatrix, CooMatrixExt, CsrMatrix, Matrix, Vector},
@@ -94,11 +95,54 @@ fn nc_lumped_mass_inverse_blocks(
   grade: ExteriorGrade,
   lumped_mass: &GalMat,
 ) -> (Vec<Vec<usize>>, Vec<Matrix>) {
+  let layout = DofLayout::identity(topology.skeleton(grade).len());
+  nc_lumped_mass_inverse_blocks_for_whitney_layout(topology, grade, lumped_mass, &layout)
+    .expect("identity Whitney layout must be valid")
+}
+
+fn nc_lumped_mass_inverse_blocks_for_whitney_layout(
+  topology: &Complex,
+  grade: ExteriorGrade,
+  lumped_mass: &GalMat,
+  layout: &DofLayout,
+) -> Result<(Vec<Vec<usize>>, Vec<Matrix>), String> {
   let ndofs = nc_ndofs(topology, grade);
   assert_eq!(lumped_mass.nrows(), ndofs);
   assert_eq!(lumped_mass.ncols(), ndofs);
 
-  let vertex_dofs = nc_vertex_dofs(topology, grade);
+  let whitney_dimension = topology.skeleton(grade).len();
+  if layout.full_dimension != whitney_dimension {
+    return Err(format!(
+      "degree-{grade} Whitney layout has full dimension {}, expected {whitney_dimension}",
+      layout.full_dimension
+    ));
+  }
+
+  let mut active_whitney = vec![false; whitney_dimension];
+  for &dof in &layout.active_dofs {
+    if dof >= whitney_dimension {
+      return Err(format!(
+        "degree-{grade} active Whitney dof {dof} is outside dimension {whitney_dimension}"
+      ));
+    }
+    if active_whitney[dof] {
+      return Err(format!(
+        "degree-{grade} active Whitney dof {dof} appears more than once"
+      ));
+    }
+    active_whitney[dof] = true;
+  }
+
+  let vertex_dofs = nc_vertex_dofs(topology, grade)
+    .into_iter()
+    .map(|dofs| {
+      dofs
+        .into_iter()
+        .filter(|dof| active_whitney[dof / nc_slots(grade)])
+        .collect::<Vec<_>>()
+    })
+    .filter(|dofs| !dofs.is_empty())
+    .collect::<Vec<_>>();
   let mut dof_locations = vec![None; ndofs];
   let mut blocks = Vec::with_capacity(vertex_dofs.len());
   for (ivertex, dofs) in vertex_dofs.iter().enumerate() {
@@ -110,11 +154,12 @@ fn nc_lumped_mass_inverse_blocks(
   }
 
   for (r, c, &v) in lumped_mass.triplet_iter() {
-    let Some((ivertex_r, ilocal_r)) = dof_locations[r] else {
-      panic!("NC{grade} dof {r} is not associated with a mesh vertex.");
-    };
-    let Some((ivertex_c, ilocal_c)) = dof_locations[c] else {
-      panic!("NC{grade} dof {c} is not associated with a mesh vertex.");
+    let (Some((ivertex_r, ilocal_r)), Some((ivertex_c, ilocal_c))) =
+      (dof_locations[r], dof_locations[c])
+    else {
+      // Couplings to prescribed full-polynomial slots are discarded before
+      // the surviving auxiliary vertex blocks are inverted.
+      continue;
     };
 
     if ivertex_r != ivertex_c {
@@ -133,12 +178,14 @@ fn nc_lumped_mass_inverse_blocks(
       block
         .clone()
         .cholesky()
-        .unwrap_or_else(|| panic!("NC{grade} lumped mass vertex block must be positive definite."))
-        .inverse()
+        .ok_or_else(|| {
+          format!("degree-{grade} reduced NC lumped-mass vertex block must be positive definite")
+        })
+        .map(|factor| factor.inverse())
     })
-    .collect();
+    .collect::<Result<Vec<_>, _>>()?;
 
-  (vertex_dofs, inverse_blocks)
+  Ok((vertex_dofs, inverse_blocks))
 }
 
 fn assemble_nc_lumped_mass_inverse_from_blocks(
@@ -166,15 +213,37 @@ fn assemble_whitney_projected_sparse_inverse_from_blocks(
   vertex_dofs: &[Vec<usize>],
   inverse_blocks: &[Matrix],
 ) -> GalMat {
-  let nsimps = topology.skeleton(grade).len();
+  let layout = DofLayout::identity(topology.skeleton(grade).len());
+  assemble_whitney_projected_sparse_inverse_from_blocks_with_layout(
+    grade,
+    vertex_dofs,
+    inverse_blocks,
+    &layout,
+  )
+}
+
+fn assemble_whitney_projected_sparse_inverse_from_blocks_with_layout(
+  grade: ExteriorGrade,
+  vertex_dofs: &[Vec<usize>],
+  inverse_blocks: &[Matrix],
+  layout: &DofLayout,
+) -> GalMat {
   let slots = nc_slots(grade);
   let scale = (slots as f64).recip().powi(2);
-  let mut galmat = GalMat::new(nsimps, nsimps);
+  let mut reduced_by_full = vec![None; layout.full_dimension];
+  for (reduced, full) in layout.active_dofs.iter().copied().enumerate() {
+    reduced_by_full[full] = Some(reduced);
+  }
+  let mut galmat = GalMat::new(layout.reduced_dimension(), layout.reduced_dimension());
   for (dofs, block) in vertex_dofs.iter().zip(inverse_blocks) {
     for (ilocal, &idof) in dofs.iter().enumerate() {
-      let isimp = idof / slots;
+      let Some(isimp) = reduced_by_full[idof / slots] else {
+        continue;
+      };
       for (jlocal, &jdof) in dofs.iter().enumerate() {
-        let jsimp = jdof / slots;
+        let Some(jsimp) = reduced_by_full[jdof / slots] else {
+          continue;
+        };
         let value = scale * block[(ilocal, jlocal)];
         if value != 0.0 {
           galmat.push(isimp, jsimp, value);
@@ -857,6 +926,48 @@ pub fn assemble_whitney_projected_sparse_inverse_galmat_for_grade(
     &vertex_dofs,
     &inverse_blocks,
   )
+}
+
+/// Assemble the projected sparse inverse after reducing its full-polynomial
+/// auxiliary space compatibly with a Whitney coefficient layout.
+///
+/// Every prescribed Whitney degree-`grade` simplex removes all `grade + 1`
+/// corresponding full-polynomial/NC coefficient slots.  The surviving
+/// principal subblocks of the lumped auxiliary metric are then inverted
+/// vertex by vertex and retracted to the active Whitney coefficients.  Thus
+/// reduction occurs before block inversion; this generally differs from the
+/// active principal submatrix of the inverse assembled on the full space.
+///
+/// This is a coefficient-space contract for homogeneous essential data.  It
+/// does not by itself assert that the reduced auxiliary space realizes a
+/// particular continuous trace condition.
+pub fn assemble_reduced_whitney_projected_sparse_inverse_galmat_for_grade(
+  topology: &Complex,
+  geometry: &MeshLengths,
+  grade: ExteriorGrade,
+  layout: &DofLayout,
+) -> Result<GalMat, String> {
+  let lumped_mass = assemble_nc_lumped_mass_galmat(topology, geometry, grade);
+  let (vertex_dofs, inverse_blocks) =
+    nc_lumped_mass_inverse_blocks_for_whitney_layout(topology, grade, &lumped_mass, layout)?;
+  Ok(
+    assemble_whitney_projected_sparse_inverse_from_blocks_with_layout(
+      grade,
+      &vertex_dofs,
+      &inverse_blocks,
+      layout,
+    ),
+  )
+}
+
+/// One-form convenience wrapper for
+/// [`assemble_reduced_whitney_projected_sparse_inverse_galmat_for_grade`].
+pub fn assemble_reduced_whitney_projected_sparse_inverse_galmat(
+  topology: &Complex,
+  geometry: &MeshLengths,
+  layout: &DofLayout,
+) -> Result<GalMat, String> {
+  assemble_reduced_whitney_projected_sparse_inverse_galmat_for_grade(topology, geometry, 1, layout)
 }
 
 pub fn assemble_whitney_projected_sparse_inverse_galmat(
